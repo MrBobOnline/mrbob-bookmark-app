@@ -11,8 +11,5 @@
       "dest": "app.py"
     }
   ],
-  "env": {
-    "GMAIL_EMAIL": "@gmail_email",
-    "GMAIL_PASSWORD": "@gmail_password"
-  }
+  "env": {}
 }
