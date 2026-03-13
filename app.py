@@ -80,7 +80,7 @@ def check_emails():
         mail.select("INBOX")
         
         # Search for unread emails with "Save -" in subject
-        status, messages = mail.search(None, 'UNSEEN', 'SUBJECT', 'Save -')
+        status, messages = mail.search(None, 'UNSEEN', '(SUBJECT "Save -")')
         
         if status != 'OK':
             return 0
