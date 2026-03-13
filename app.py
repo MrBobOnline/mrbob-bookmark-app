@@ -5,63 +5,61 @@ Email-based bookmark/resource organizer
 """
 
 import os
-import sqlite3
-import json
 import re
 import imaplib
 import email
 import http.client
-from datetime import datetime
+import psycopg2
+from psycopg2.extras import RealDictCursor
 from flask import Flask, request, render_template_string, jsonify
 
 app = Flask(__name__)
 
-DB_PATH = "/tmp/bookmarks.db"
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
 GMAIL_EMAIL = os.environ.get("GMAIL_EMAIL", "onlineab9@gmail.com")
 GMAIL_PASSWORD = os.environ.get("GMAIL_PASSWORD", "")
 
+def get_db():
+    """Get database connection."""
+    conn = psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
+    return conn
+
 def init_db():
-    """Initialize SQLite database."""
-    conn = sqlite3.connect(DB_PATH)
+    """Initialize database tables."""
+    conn = get_db()
     c = conn.cursor()
     
     c.execute('''CREATE TABLE IF NOT EXISTS categories (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        id SERIAL PRIMARY KEY,
         name TEXT UNIQUE NOT NULL,
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )''')
     
     c.execute('''CREATE TABLE IF NOT EXISTS resources (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        id SERIAL PRIMARY KEY,
         category_id INTEGER NOT NULL,
         title TEXT NOT NULL,
         description TEXT,
         url TEXT,
         is_favorite INTEGER DEFAULT 0,
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY (category_id) REFERENCES categories(id) ON DELETE CASCADE
     )''')
     
     conn.commit()
     conn.close()
 
-def get_db():
-    """Get database connection."""
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
-
 def extract_from_url(url):
     """Extract title/meta from URL."""
     try:
-        conn = http.client.HTTPSConnection("www.openrouter.ai" if "openrouter" in url else url.split('/')[2])
+        hostname = url.split('/')[2]
+        conn = http.client.HTTPSConnection(hostname, timeout=5)
         headers = {'User-Agent': 'Mozilla/5.0'}
-        conn.request('GET', '/', headers=headers, timeout=5)
+        conn.request('GET', '/', headers=headers)
         response = conn.getresponse()
         html = response.read().decode('utf-8', errors='ignore')
         
-        # Extract title from <title> tag
         title_match = re.search(r'<title[^>]*>([^<]+)</title>', html, re.IGNORECASE)
         if title_match:
             return title_match.group(1).strip()
@@ -79,7 +77,6 @@ def check_emails():
         mail.login(GMAIL_EMAIL, GMAIL_PASSWORD)
         mail.select("INBOX")
         
-        # Search for unread emails with "Save -" in subject
         status, messages = mail.search(None, 'UNSEEN', '(SUBJECT "Save -")')
         
         if status != 'OK':
@@ -96,7 +93,6 @@ def check_emails():
             msg = email.message_from_bytes(msg_data[0][1])
             subject = msg.get('Subject', '')
             
-            # Parse subject: "Save - [Category]"
             match = re.match(r'Save\s*-\s*(.+)', subject, re.IGNORECASE)
             if not match:
                 continue
@@ -105,7 +101,6 @@ def check_emails():
             body = ""
             url = None
             
-            # Extract body and URL
             if msg.is_multipart():
                 for part in msg.walk():
                     if part.get_content_type() == 'text/plain':
@@ -114,12 +109,10 @@ def check_emails():
             else:
                 body = msg.get_payload(decode=True).decode('utf-8', errors='ignore')
             
-            # Extract URL from body
             url_match = re.search(r'https?://[^\s\n]+', body)
             if url_match:
                 url = url_match.group(0)
             
-            # Get title from URL or use first line of body
             title = None
             if url:
                 title = extract_from_url(url)
@@ -127,31 +120,26 @@ def check_emails():
             if not title:
                 title = body.split('\n')[0][:100] if body else category_name
             
-            # Save to database
             conn = get_db()
             c = conn.cursor()
             
-            # Get or create category
-            c.execute('SELECT id FROM categories WHERE name = ?', (category_name,))
+            c.execute('SELECT id FROM categories WHERE name = %s', (category_name,))
             cat = c.fetchone()
             
             if not cat:
-                c.execute('INSERT INTO categories (name) VALUES (?)', (category_name,))
-                conn.commit()
-                category_id = c.lastrowid
+                c.execute('INSERT INTO categories (name) VALUES (%s) RETURNING id', (category_name,))
+                category_id = c.fetchone()['id']
             else:
                 category_id = cat['id']
             
-            # Insert resource
             c.execute('''INSERT INTO resources (category_id, title, description, url)
-                        VALUES (?, ?, ?, ?)''',
+                        VALUES (%s, %s, %s, %s)''',
                      (category_id, title, body[:500], url))
             conn.commit()
             conn.close()
             
             processed += 1
             
-            # Mark email as read
             mail.store(email_id, '+FLAGS', '\\Seen')
         
         mail.close()
@@ -318,7 +306,6 @@ HTML = '''
             event.target.classList.add('active');
         }
         
-        // Load categories and resources on startup
         async function init() {
             const res = await fetch('/api/categories');
             const cats = await res.json();
@@ -361,7 +348,7 @@ def get_resources():
     else:
         c.execute('''SELECT resources.* FROM resources 
                      JOIN categories ON resources.category_id = categories.id
-                     WHERE categories.name = ? ORDER BY resources.created_at DESC''', (category,))
+                     WHERE categories.name = %s ORDER BY resources.created_at DESC''', (category,))
     
     resources = [dict(row) for row in c.fetchall()]
     conn.close()
@@ -374,13 +361,13 @@ def update_resource(rid):
     c = conn.cursor()
     
     if 'is_favorite' in data:
-        c.execute('UPDATE resources SET is_favorite = ? WHERE id = ?', (data['is_favorite'], rid))
+        c.execute('UPDATE resources SET is_favorite = %s WHERE id = %s', (data['is_favorite'], rid))
     if 'title' in data:
-        c.execute('UPDATE resources SET title = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?', (data['title'], rid))
+        c.execute('UPDATE resources SET title = %s, updated_at = CURRENT_TIMESTAMP WHERE id = %s', (data['title'], rid))
     if 'description' in data:
-        c.execute('UPDATE resources SET description = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?', (data['description'], rid))
+        c.execute('UPDATE resources SET description = %s, updated_at = CURRENT_TIMESTAMP WHERE id = %s', (data['description'], rid))
     if 'url' in data:
-        c.execute('UPDATE resources SET url = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?', (data['url'], rid))
+        c.execute('UPDATE resources SET url = %s, updated_at = CURRENT_TIMESTAMP WHERE id = %s', (data['url'], rid))
     
     conn.commit()
     conn.close()
@@ -390,7 +377,7 @@ def update_resource(rid):
 def delete_resource(rid):
     conn = get_db()
     c = conn.cursor()
-    c.execute('DELETE FROM resources WHERE id = ?', (rid,))
+    c.execute('DELETE FROM resources WHERE id = %s', (rid,))
     conn.commit()
     conn.close()
     return jsonify({"ok": True})

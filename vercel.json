@@ -11,5 +11,11 @@
       "dest": "app.py"
     }
   ],
-  "env": {}
+  "env": {},
+  "crons": [
+    {
+      "path": "/api/check-emails",
+      "schedule": "0 * * * *"
+    }
+  ]
 }
